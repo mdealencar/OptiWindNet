@@ -12,11 +12,11 @@ from itertools import chain, pairwise
 from socket import getfqdn, gethostname
 from typing import Any, Mapping
 
+import awkward as ak
 import networkx as nx
 import numpy as np
-from pony import orm
 
-from .modelv2 import define_entities
+from .modelv2 import ParquetDatabase, create_empty_data
 from ..interarraylib import calcload
 from ..utils import make_handle
 
@@ -24,106 +24,65 @@ __all__ = ()
 
 PackType = Mapping[str, Any]
 
-# Set of not-to-store keys commonly found in G routesets (they are either
-# already stored in database fields or are cheap to regenerate or too big.
 _misc_not = {
-    'VertexC',
-    'anglesYhp',
-    'anglesXhp',
-    'anglesRank',
-    'angles',
-    'd2rootsRank',
-    'd2roots',
-    'name',
-    'boundary',
-    'capacity',
-    'B',
-    'runtime',
-    'runtime_unit',
-    'edges_fun',
-    'D',
-    'DetourC',
-    'fnT',
-    'landscape_angle',
-    'Root',
-    'creation_options',
-    'G_nodeset',
-    'T',
-    'non_A_gates',
-    'funfile',
-    'funhash',
-    'funname',
-    'diagonals',
-    'planar',
-    'has_loads',
-    'R',
-    'Subtree',
-    'handle',
-    'non_A_edges',
-    'max_load',
-    'fun_fingerprint',
-    'hull',
-    'solver_log',
-    'length_mismatch_on_db_read',
-    'gnT',
-    'C',
-    'border',
-    'obstacles',
-    'num_diagonals',
-    'crossings_map',
-    'tentative',
-    'method_options',
-    'is_normalized',
-    'norm_scale',
-    'norm_offset',
-    'detextra',
-    'rogue',
-    'clone2prime',
-    'valid',
-    'path_in_P',
-    'shortened_contours',
-    'nonAedges',
-    'method',
-    'num_stunts',
-    'crossings',
-    'creator',
-    'inter_terminal_clearance_min',
-    'inter_terminal_clearance_safe',
+    'VertexC', 'anglesYhp', 'anglesXhp', 'anglesRank', 'angles', 'd2rootsRank',
+    'd2roots', 'name', 'boundary', 'capacity', 'B', 'runtime', 'runtime_unit',
+    'edges_fun', 'D', 'DetourC', 'fnT', 'landscape_angle', 'Root',
+    'creation_options', 'G_nodeset', 'T', 'non_A_gates', 'funfile', 'funhash',
+    'funname', 'diagonals', 'planar', 'has_loads', 'R', 'Subtree', 'handle',
+    'non_A_edges', 'max_load', 'fun_fingerprint', 'hull', 'solver_log',
+    'length_mismatch_on_db_read', 'gnT', 'C', 'border', 'obstacles',
+    'num_diagonals', 'crossings_map', 'tentative', 'method_options',
+    'is_normalized', 'norm_scale', 'norm_offset', 'detextra', 'rogue',
+    'clone2prime', 'valid', 'path_in_P', 'shortened_contours', 'nonAedges',
+    'method', 'num_stunts', 'crossings', 'creator',
+    'inter_terminal_clearance_min', 'inter_terminal_clearance_safe',
     'stunts_primes',
 }
 
 
-def open_database(filepath: str, create_db: bool = False) -> orm.Database:
-    """Opens the sqlite database v2 file specified in `filepath`.
+def _normalize_int_array(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return value.astype(int).tolist()
+    return [int(v) for v in value]
+
+
+def open_database(filepath: str, create_db: bool = False) -> ParquetDatabase:
+    """Open or create the v2 awkward/parquet database file.
 
     Args:
-      filepath: path to database file
-      create_db: True -> create a new file if it does not exist
+        filepath: Path to parquet-backed database file.
+        create_db: If True, create a new database file when missing.
 
     Returns:
-      Database object (Pony ORM)
+        ParquetDatabase handle exposing NodeSet/Method/Machine/RouteSet tables.
     """
-    db = orm.Database()
-    define_entities(db)
-    db.bind(
-        'sqlite', os.path.abspath(os.path.expanduser(filepath)), create_db=create_db
-    )
-    db.generate_mapping(create_tables=True)
-    return db
+    filepath = os.path.abspath(os.path.expanduser(filepath))
+    if not os.path.exists(filepath) or (create_db and os.path.getsize(filepath) == 0):
+        if not create_db:
+            raise OSError(f'Database file does not exist: {filepath}')
+        data = create_empty_data()
+        db = ParquetDatabase(filepath, data)
+        db.save()
+        return db
+    data = ak.from_parquet(filepath).to_list()[0]
+    return ParquetDatabase(filepath, data)
 
 
 def L_from_nodeset(nodeset: object, handle: str | None = None) -> nx.Graph:
-    """Translate a NodeSet database entry to a location graph.
+    """Translate a NodeSet record into a location graph.
 
     Args:
-      nodeset: an entry from the database NodeSet table.
+        nodeset: NodeSet-like record from the database.
+        handle: Optional location handle override.
 
     Returns:
-      Graph L containing the positions and location metadata.
+        NetworkX graph with location geometry and node kinds.
     """
     T = nodeset.T
     R = nodeset.R
-    # assert B == sum(n >= T for n in nodeset.constraint_vertices)
     B = nodeset.B
     border = np.array(nodeset.constraint_vertices[: nodeset.constraint_groups[0]])
     name = nodeset.name
@@ -154,13 +113,13 @@ def L_from_nodeset(nodeset: object, handle: str | None = None) -> nx.Graph:
 
 
 def G_from_routeset(routeset: object) -> nx.Graph:
-    """Translate a RouteSet database entry to a routeset graph.
+    """Translate a RouteSet record into a routeset graph.
 
     Args:
-      routeset: an entry from the database RouteSet table.
+        routeset: RouteSet-like record from the database.
 
     Returns:
-      Graph G containing the routeset.
+        NetworkX graph reconstructed from terse edge representation.
     """
     nodeset = routeset.nodes
     R = nodeset.R
@@ -173,19 +132,17 @@ def G_from_routeset(routeset: object) -> nx.Graph:
         creator=routeset.creator,
         method=dict(
             solver_name=routeset.method.solver_name,
-            timestamp=routeset.method.timestamp,
+            timestamp=getattr(routeset.method, 'timestamp', None),
             funname=routeset.method.funname,
             funfile=routeset.method.funfile,
             funhash=routeset.method.funhash,
         ),
         runtime=routeset.runtime,
         method_options=routeset.method.options,
-        **routeset.misc,
+        **(routeset.misc or {}),
     )
-
     if routeset.detextra is not None:
         G.graph['detextra'] = routeset.detextra
-
     if routeset.stuntC:
         stuntC = np.lib.format.read_array(io.BytesIO(routeset.stuntC))
         num_stunts = len(stuntC)
@@ -193,11 +150,8 @@ def G_from_routeset(routeset: object) -> nx.Graph:
         G.graph['B'] += num_stunts
         VertexC = G.graph['VertexC']
         G.graph['VertexC'] = np.vstack((VertexC[:-R], stuntC, VertexC[-R:]))
-    untersify_to_G(G, terse=routeset.edges, clone2prime=routeset.clone2prime)
+    untersify_to_G(G, terse=np.array(routeset.edges), clone2prime=routeset.clone2prime)
     calc_length = G.size(weight='length')
-    #  assert abs(calc_length/routeset.length - 1) < 1e-5, (
-    #      f"recreated graph's total length ({calc_length:.0f}) != "
-    #      f"stored total length ({routeset.length:.0f})")
     if abs(calc_length / routeset.length - 1) > 1e-5:
         G.graph['length_mismatch_on_db_read'] = calc_length - routeset.length
     if routeset.rogue:
@@ -210,6 +164,7 @@ def G_from_routeset(routeset: object) -> nx.Graph:
 
 
 def packnodes(G: nx.Graph) -> PackType:
+    """Pack a location graph into a NodeSet-compatible payload."""
     R, T, B = (G.graph[k] for k in 'RTB')
     VertexC = G.graph['VertexC']
     num_stunts = G.graph.get('num_stunts')
@@ -220,82 +175,59 @@ def packnodes(G: nx.Graph) -> PackType:
     np.lib.format.write_array(VertexC_npy_io, VertexC, version=(3, 0))
     VertexC_npy = VertexC_npy_io.getvalue()
     digest = sha256(VertexC_npy).digest()
-
     if G.name[0] == '!':
         name = G.name + base64.b64encode(digest).decode('ascii')
     else:
         name = G.name
-    constraint_vertices = list(
-        chain((G.graph.get('border', ()),), G.graph.get('obstacles', ()))
-    )
-    pack = dict(
+    constraint_vertices = list(chain((G.graph.get('border', ()),), G.graph.get('obstacles', ())))
+    return dict(
         T=T,
         R=R,
         B=B,
         name=name,
         VertexC=VertexC_npy,
         constraint_groups=[p.shape[0] for p in constraint_vertices],
-        constraint_vertices=np.concatenate(
-            constraint_vertices, dtype=int, casting='unsafe'
-        ),
+        constraint_vertices=np.concatenate(constraint_vertices, dtype=int, casting='unsafe'),
         landscape_angle=G.graph.get('landscape_angle', 0.0),
         digest=digest,
     )
-    return pack
 
 
 def packmethod(method_options: dict) -> PackType:
-    options = {
-        k: method_options[k]
-        for k in sorted(method_options)
-        if k not in ('fun_fingerprint', 'solver_name')
-    }
+    """Pack solver/method metadata into a Method-compatible payload."""
+    options = {k: method_options[k] for k in sorted(method_options) if k not in ('fun_fingerprint', 'solver_name')}
     ffprint = method_options['fun_fingerprint']
     digest = sha256(ffprint['funhash'] + json.dumps(options).encode()).digest()
-    pack = dict(
-        digest=digest,
-        solver_name=method_options['solver_name'],
-        options=options,
-        **ffprint,
-    )
-    return pack
+    return dict(digest=digest, solver_name=method_options['solver_name'], options=options, **ffprint)
 
 
 def add_if_absent(entity: object, pack: PackType) -> bytes:
+    """Insert a row if its digest is not present and return digest PK."""
     digest = pack['digest']
-    with orm.db_session:
-        if not entity.exists(digest=digest):
-            entity(**pack)
+    if not entity.exists(digest=digest):
+        row = dict(pack)
+        if 'constraint_vertices' in row:
+            row['constraint_vertices'] = _normalize_int_array(row['constraint_vertices'])
+        if 'constraint_groups' in row:
+            row['constraint_groups'] = _normalize_int_array(row['constraint_groups'])
+        if 'timestamp' in row and hasattr(row['timestamp'], 'isoformat'):
+            row['timestamp'] = row['timestamp'].isoformat()
+        entity.add(row)
     return digest
 
 
-def method_from_G(G: nx.Graph, db: orm.Database) -> bytes:
-    """
-    Returns:
-        Primary key of the entry.
-    """
-    pack = packmethod(G.graph['method_options'])
-    return add_if_absent(db.Method, pack)
+def method_from_G(G: nx.Graph, db: ParquetDatabase) -> bytes:
+    """Ensure Method exists for graph G and return its digest PK."""
+    return add_if_absent(db.Method, packmethod(G.graph['method_options']))
 
 
-def nodeset_from_G(G: nx.Graph, db: orm.Database) -> bytes:
-    """Returns primary key of the entry."""
-    pack = packnodes(G)
-    return add_if_absent(db.NodeSet, pack)
+def nodeset_from_G(G: nx.Graph, db: ParquetDatabase) -> bytes:
+    """Ensure NodeSet exists for graph G and return its digest PK."""
+    return add_if_absent(db.NodeSet, packnodes(G))
 
 
 def terse_pack_from_G(G: nx.Graph) -> PackType:
-    """Convert `G`'s edges to a format suitable for storing in the database.
-
-    Although graph `G` in undirected, the edge attribute `'reverse'` and its
-    nodes' numbers encode the direction of power flow. The terse
-    representation uses that and the fact that `G` is a tree.
-
-    Returns:
-        dict with keys:
-            edges: where ⟨i, edges[i]⟩ is a directed edge of `G`
-            clone2prime: mapping the above-T clones to below-T nodes
-    """
+    """Pack graph edges to terse directed representation for storage."""
     R, T, B = (G.graph[k] for k in 'RTB')
     C, D = (G.graph.get(k, 0) for k in 'CD')
     terse = np.empty((T + C + D,), dtype=int)
@@ -306,10 +238,7 @@ def terse_pack_from_G(G: nx.Graph) -> PackType:
             raise ValueError('reverse must not be None')
         u, v = (u, v) if u < v else (v, u)
         i, target = (u, v) if reverse else (v, u)
-        if i < T:
-            terse[i] = target
-        else:
-            terse[i - B] = target
+        terse[i if i < T else i - B] = target
     terse_pack = dict(edges=terse)
     if C > 0 or D > 0:
         terse_pack['clone2prime'] = G.graph['fnT'][T + B : -R]
@@ -317,9 +246,7 @@ def terse_pack_from_G(G: nx.Graph) -> PackType:
 
 
 def untersify_to_G(G: nx.Graph, terse: np.ndarray, clone2prime: list) -> None:
-    """
-    Changes G in place!
-    """
+    """Expand terse edge representation and attach weighted edges to G."""
     R, T, B = (G.graph[k] for k in 'RTB')
     C, D = (G.graph.get(k, 0) for k in 'CD')
     VertexC = G.graph['VertexC']
@@ -337,9 +264,7 @@ def untersify_to_G(G: nx.Graph, terse: np.ndarray, clone2prime: list) -> None:
         Length = np.hypot(*(VertexC[fnT[terse]] - VertexC[fnT[source]]).T)
     else:
         Length = np.hypot(*(VertexC[terse] - VertexC[source]).T)
-    G.add_weighted_edges_from(
-        zip(source.tolist(), terse, Length.tolist()), weight='length'
-    )
+    G.add_weighted_edges_from(zip(source.tolist(), terse, Length.tolist()), weight='length')
     if clone2prime:
         for _, _, edgeD in G.edges(contournodes, data=True):
             edgeD['kind'] = 'contour'
@@ -349,50 +274,31 @@ def untersify_to_G(G: nx.Graph, terse: np.ndarray, clone2prime: list) -> None:
 
 
 def oddtypes_to_serializable(obj):
-    if isinstance(obj, orm.ormtypes.TrackedList):
-        return list(oddtypes_to_serializable(item) for item in obj)
-    if isinstance(obj, orm.ormtypes.TrackedDict):
-        return {k: oddtypes_to_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(oddtypes_to_serializable(item) for item in obj)
-    elif isinstance(obj, np.ndarray):
+    if isinstance(obj, np.ndarray):
         return obj.tolist()
-    elif isinstance(obj, np.int64):
+    if isinstance(obj, (np.int64, np.int32)):
         return int(obj)
-    elif isinstance(obj, np.int32):
-        return int(obj)
-    else:
-        return obj
+    return obj
 
 
 def pack_G(G: nx.Graph) -> dict[str, Any]:
+    """Pack a routeset graph into a RouteSet-compatible payload."""
     R, T, B = (G.graph[k] for k in 'RTB')
     C, D = (G.graph.get(k, 0) for k in 'CD')
     terse_pack = terse_pack_from_G(G)
     misc = {key: G.graph[key] for key in G.graph.keys() - _misc_not}
-    #  print('Storing in `misc`:', *misc.keys())
     for k, v in misc.items():
         misc[k] = oddtypes_to_serializable(v)
     length = G.size(weight='length')
-    handle = G.graph.get('handle')
-    if handle is None:
-        handle = make_handle(G.graph['name'])
+    handle = G.graph.get('handle') or make_handle(G.graph['name'])
     packed_G = dict(
-        R=R,
-        T=T,
-        C=C,
-        D=D,
-        handle=handle,
-        capacity=G.graph['capacity'],
-        length=length,
-        creator=G.graph['creator'],
-        is_normalized=G.graph.get('is_normalized', False),
-        runtime=G.graph['runtime'],
-        num_gates=[len(G[root]) for root in range(-R, 0)],
-        misc=misc,
-        **terse_pack,
+        R=R, T=T, C=C, D=D, handle=handle, capacity=G.graph['capacity'],
+        length=length, creator=G.graph['creator'],
+        is_normalized=G.graph.get('is_normalized', False), runtime=G.graph['runtime'],
+        num_gates=[len(G[root]) for root in range(-R, 0)], misc=misc, **terse_pack,
     )
-    # Optional fields
     num_stunts = G.graph.get('num_stunts')
     if num_stunts:
         VertexC = G.graph['VertexC']
@@ -403,98 +309,64 @@ def pack_G(G: nx.Graph) -> dict[str, Any]:
     if C + D > 0:
         packed_G['clone2prime'] = G.graph['fnT'][-C - D - R : -R].tolist()
     concatenate_tuples = partial(sum, start=())
-    pack_if_given = (  # key, function to prepare data
-        ('detextra', None),
-        ('num_diagonals', None),
-        ('valid', None),
-        ('tentative', concatenate_tuples),
-        ('rogue', concatenate_tuples),
-    )
-    packed_G.update(
-        {
-            k: (fun(G.graph[k]) if fun else G.graph[k])
-            for k, fun in pack_if_given
-            if k in G.graph
-        }
-    )
+    for k, fun in (('detextra', None), ('num_diagonals', None), ('valid', None), ('tentative', concatenate_tuples), ('rogue', concatenate_tuples)):
+        if k in G.graph:
+            packed_G[k] = fun(G.graph[k]) if fun else G.graph[k]
     return packed_G
 
 
-def store_G(G: nx.Graph, db: orm.Database) -> int:
-    """Store `G`'s data to a new `RouteSet` record in the database `db`.
-
-    If the NodeSet or Method are not yet in the database, they will be added.
-
-    Args:
-        G: Graph with the routeset.
-        db: Database instance.
-
-    Returns:
-        Primary key of the newly created RouteSet record.
-    """
+def store_G(G: nx.Graph, db: ParquetDatabase) -> int:
+    """Store graph G as a new RouteSet and return its integer id."""
     packed_G = pack_G(G)
     nodesetID = nodeset_from_G(G, db)
-    methodID = (method_from_G(G, db),)
+    methodID = method_from_G(G, db)
     machineID = get_machine_pk(db)
-    with orm.db_session:
-        packed_G.update(
-            nodes=db.NodeSet[nodesetID],
-            method=db.Method[methodID],
-            machine=db.Machine[machineID],
-        )
-        rs = db.RouteSet(**packed_G)
-        db.flush()
-        id = rs.id
-    return id
+    row = dict(packed_G)
+    row['id'] = db._next_id('routesets')
+    row['nodes'] = nodesetID
+    row['method'] = methodID
+    row['machine'] = machineID
+    row['edges'] = _normalize_int_array(row['edges'])
+    row['clone2prime'] = _normalize_int_array(row.get('clone2prime'))
+    row['num_gates'] = _normalize_int_array(row.get('num_gates'))
+    row['tentative'] = _normalize_int_array(row.get('tentative'))
+    row['rogue'] = _normalize_int_array(row.get('rogue'))
+    row['misc'] = row.get('misc') or None
+    db.RouteSet.add(row)
+    db.save()
+    return row['id']
 
 
-def get_machine_pk(db: orm.Database) -> int:
+def get_machine_pk(db: ParquetDatabase) -> int:
+    """Get or create current machine record and return its id."""
     fqdn = getfqdn()
     hostname = gethostname()
     if fqdn == 'localhost':
         machine = hostname
+    elif hostname.startswith('n-'):
+        machine = fqdn[len(hostname) :]
     else:
-        if hostname.startswith('n-'):
-            machine = fqdn[len(hostname) :]
-        else:
-            machine = fqdn
-    with orm.db_session:
-        if db.Machine.exists(name=machine):
-            return db.Machine.get(name=machine).get_pk()
-        else:
-            return db.Machine(name=machine).get_pk()
+        machine = fqdn
+    entry = db.Machine.get(name=machine)
+    if entry:
+        return entry.id
+    mid = db._next_id('machines')
+    db.Machine.add({'id': mid, 'name': machine, 'attrs': None})
+    return mid
 
 
-def G_by_method(G: nx.Graph, method: object, db: orm.Database) -> nx.Graph:
-    """Fetch from the database a layout for `G` by `method`.
-    `G` must be a layout solution with the necessary info in the G.graph dict.
-    `method` is a Method.
-    """
+def G_by_method(G: nx.Graph, method: object, db: ParquetDatabase) -> nx.Graph:
+    """Fetch routeset for location/capacity matching the provided method."""
     farmname = G.name
     c = G.graph['capacity']
-    rs = db.RouteSet.get(
-        lambda rs: rs.nodes.name == farmname
-        and rs.method is method
-        and rs.capacity == c
-    )
+    rs = db.RouteSet.get(lambda rs: rs.nodes.name == farmname and rs.method.digest == method.digest and rs.capacity == c)
     Gdb = G_from_routeset(rs)
     calcload(Gdb)
     return Gdb
 
 
-def Gs_from_attrs(
-    farm: object,
-    methods: object | Sequence[object],
-    capacities: int | Sequence[int],
-    db: orm.Database,
-) -> list[tuple[nx.Graph]]:
-    """
-    Fetch from the database a list (one per capacity) of tuples (one per
-    method) of layouts.
-    `farm` must have the desired NodeSet name in the `name` attribute.
-    `methods` is a (sequence of) Method instance(s).
-    `capacities` is a (sequence of) int(s).
-    """
+def Gs_from_attrs(farm: object, methods: object | Sequence[object], capacities: int | Sequence[int], db: ParquetDatabase) -> list[tuple[nx.Graph]]:
+    """Fetch tuples of routeset graphs for methods across capacities."""
     Gs = []
     if not isinstance(methods, Sequence):
         methods = (methods,)
@@ -502,13 +374,7 @@ def Gs_from_attrs(
         capacities = (capacities,)
     for c in capacities:
         Gtuple = tuple(
-            G_from_routeset(
-                db.RouteSet.get(
-                    lambda rs: rs.nodes.name == farm.name
-                    and rs.method is m
-                    and rs.capacity == c
-                )
-            )
+            G_from_routeset(db.RouteSet.get(lambda rs: rs.nodes.name == farm.name and rs.method.digest == m.digest and rs.capacity == c))
             for m in methods
         )
         for G in Gtuple:

@@ -39,7 +39,8 @@ dependencies = [
     "numba >=0.62.1",
     "numpy >=2.0",
     "ortools >=9.12.4544",
-    "pony >=0.7.18",
+    "awkward >=2.8.4",
+    "pyarrow >=21.0.0",
     "py >=1.11.0",
     "Pyomo >=6.9.5",
     "PyYAML >=6.0.2",
@@ -48,6 +49,10 @@ dependencies = [
     "svg.py >=1.6.0",
     "utm >=0.7",
 ]
+
+
+[project.scripts]
+optiwindnet-migrate-db = "optiwindnet.db.migrate_legacy:main"
 
 [project.urls]
 "Homepage" = "https://gitlab.windenergy.dtu.dk/TOPFARM/OptiWindNet"
