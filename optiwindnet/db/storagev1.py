@@ -1,3 +1,6 @@
+def open_database(filepath: str, create_db: bool = False):
+    return _open_database(filepath, create_db=create_db)
+
 # SPDX-License-Identifier: MIT
 # https://gitlab.windenergy.dtu.dk/TOPFARM/OptiWindNet/
 
@@ -11,8 +14,7 @@ from typing import Any, Mapping
 
 import networkx as nx
 import numpy as np
-from pony import orm
-
+from .modelv1 import open_database as _open_database
 from ..interarraylib import calcload, site_fingerprint
 
 __all__ = ()
@@ -145,19 +147,18 @@ def packmethod(ffprint: dict, options: Mapping | None = None) -> PackType:
 
 def add_if_absent(entity: object, pack: PackType) -> bytes:
     digest = pack['digest']
-    with orm.db_session:
-        if not entity.exists(digest=digest):
-            entity(**pack)
+    if entity.get_or_none(entity.digest == digest) is None:
+        entity.create(**pack)
     return digest
 
 
-def method_from_graph(G: nx.Graph, db: orm.Database) -> bytes:
+def method_from_graph(G: nx.Graph, db) -> bytes:
     """Returns primary key of the entry."""
     pack = packmethod(G.graph['fun_fingerprint'], G.graph['creation_options'])
     return add_if_absent(db.Method, pack)
 
 
-def nodeset_from_graph(G: nx.Graph, db: orm.Database) -> bytes:
+def nodeset_from_graph(G: nx.Graph, db) -> bytes:
     """Returns primary key of the entry."""
     pack = packnodes(G)
     return add_if_absent(db.NodeSet, pack)
@@ -221,10 +222,6 @@ def add_edges_to(
 
 
 def oddtypes_to_serializable(obj):
-    if isinstance(obj, orm.ormtypes.TrackedList):
-        return list(oddtypes_to_serializable(item) for item in obj)
-    if isinstance(obj, orm.ormtypes.TrackedDict):
-        return {k: oddtypes_to_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(oddtypes_to_serializable(item) for item in obj)
     elif isinstance(obj, np.ndarray):
@@ -258,7 +255,7 @@ def packedges(G: nx.Graph) -> dict[str, Any]:
     return edgepack
 
 
-def edgeset_from_graph(G: nx.Graph, db: orm.Database) -> int:
+def edgeset_from_graph(G: nx.Graph, db) -> int:
     """Add a new EdgeSet entry in the database, using the data in `G`.
     If the NodeSet or Method are not yet in the database, they will be added.
 
@@ -266,43 +263,37 @@ def edgeset_from_graph(G: nx.Graph, db: orm.Database) -> int:
     """
     edgepack = packedges(G)
     nodesetID = nodeset_from_graph(G, db)
-    methodID = (method_from_graph(G, db),)
+    methodID = method_from_graph(G, db)
     machineID = get_machine_pk(db)
-    with orm.db_session:
-        edgepack.update(
-            nodes=db.NodeSet[nodesetID],
-            method=db.Method[methodID],
-            machine=db.Machine[machineID],
-        )
-        return db.EdgeSet(**edgepack).get_pk()
+    edgepack.update(
+        nodes=db.NodeSet.get_by_id(nodesetID),
+        method=db.Method.get_by_id(methodID),
+        machine=db.Machine.get_by_id(machineID),
+    )
+    return db.EdgeSet.create(**edgepack).id
 
 
-def get_machine_pk(db: orm.Database) -> int:
+def get_machine_pk(db) -> int:
     fqdn = getfqdn()
     hostname = gethostname()
     if fqdn == 'localhost':
         machine = hostname
+    elif hostname.startswith('n-'):
+        machine = fqdn[len(hostname) :]
     else:
-        if hostname.startswith('n-'):
-            machine = fqdn[len(hostname) :]
-        else:
-            machine = fqdn
-    with orm.db_session:
-        if db.Machine.exists(name=machine):
-            return db.Machine.get(name=machine).get_pk()
-        else:
-            return db.Machine(name=machine).get_pk()
+        machine = fqdn
+    old = db.Machine.get_or_none(db.Machine.name == machine)
+    if old is not None:
+        return old.id
+    return db.Machine.create(name=machine).id
 
 
-def G_by_method(G: nx.Graph, method: object, db: orm.Database) -> nx.Graph:
-    """Fetch from the database a layout for `G` by `method`.
-    `G` must be a layout solution with the necessary info in the G.graph dict.
-    `method` is a Method.
-    """
-    farmname = G.name
-    c = G.graph['capacity']
+def G_by_method(G: nx.Graph, method: object, db) -> nx.Graph:
+    farm = db.NodeSet.get(db.NodeSet.name == G.name)
     es = db.EdgeSet.get(
-        lambda e: e.nodes.name == farmname and e.method is method and e.capacity == c
+        (db.EdgeSet.nodes == farm)
+        & (db.EdgeSet.method == method)
+        & (db.EdgeSet.capacity == G.graph['capacity'])
     )
     Gdb = graph_from_edgeset(es)
     calcload(Gdb)
@@ -313,27 +304,21 @@ def Gs_from_attrs(
     farm: object,
     methods: object | Sequence[object],
     capacities: int | Sequence[int],
-    db: orm.Database,
+    db,
 ) -> list[tuple[nx.Graph]]:
-    """
-    Fetch from the database a list (one per capacity) of tuples (one per
-    method) of layouts.
-    `farm` must have the desired NodeSet name in the `name` attribute.
-    `methods` is a (sequence of) Method instance(s).
-    `capacities` is a (sequence of) int(s).
-    """
     Gs = []
     if not isinstance(methods, Sequence):
         methods = (methods,)
     if not isinstance(capacities, Sequence):
         capacities = (capacities,)
+    farm_row = db.NodeSet.get(db.NodeSet.name == farm.name)
     for c in capacities:
         Gtuple = tuple(
             graph_from_edgeset(
                 db.EdgeSet.get(
-                    lambda e: e.nodes.name == farm.name
-                    and e.method is m
-                    and e.capacity == c
+                    (db.EdgeSet.nodes == farm_row)
+                    & (db.EdgeSet.method == m)
+                    & (db.EdgeSet.capacity == c)
                 )
             )
             for m in methods

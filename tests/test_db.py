@@ -1,8 +1,6 @@
 from pathlib import Path
 import pytest
 import numpy as np
-from pony.orm import db_session
-
 from optiwindnet.api import HGSRouter
 from optiwindnet.db import open_database, G_from_routeset, L_from_nodeset
 from optiwindnet.db.storagev2 import (
@@ -36,7 +34,7 @@ def test_open_database(tmp_path):
     # create the DB
     db = open_database(str(dbfile), create_db=True)
 
-    expected_attrs = ['Entity', 'Machine', 'Method', 'NodeSet', 'RouteSet']
+    expected_attrs = ['Entity', 'Machine', 'Method', 'NodeSet', 'RouteSet', 'entities']
 
     for name in expected_attrs:
         assert hasattr(db, name), f"db should expose attribute '{name}'"
@@ -58,10 +56,9 @@ def test_L_from_nodeset(tmp_path):
     L.name = 'Test'
 
     pack = packnodes(L)
-    with db_session:
-        NodeSet = db.entities['NodeSet']
-        digest = add_if_absent(NodeSet, pack)
-        ns = NodeSet[digest]
+    NodeSet = db.entities['NodeSet']
+    digest = add_if_absent(NodeSet, pack)
+    ns = NodeSet.get_by_id(digest)
 
     L2 = L_from_nodeset(ns)
     assert L2.graph['T'] == L.graph['T']
@@ -82,9 +79,8 @@ def test_G_from_routeset(tmp_path):
     id = store_G(G, db=db)
     assert id == 1
 
-    with db_session:
-        rs = db.RouteSet[id]
-        G_rs = G_from_routeset(rs)
+    rs = db.RouteSet.get_by_id(id)
+    G_rs = G_from_routeset(rs)
 
     ignored_keys = {
         'bound',
@@ -112,10 +108,9 @@ def test_L_from_nodeset_detours(tmp_path):
     L.name = 'Test'
 
     pack = packnodes(L)
-    with db_session:
-        NodeSet = db.entities['NodeSet']
-        digest = add_if_absent(NodeSet, pack)
-        ns = NodeSet[digest]
+    NodeSet = db.entities['NodeSet']
+    digest = add_if_absent(NodeSet, pack)
+    ns = NodeSet.get_by_id(digest)
 
     L2 = L_from_nodeset(ns)
     assert L2.graph['T'] == L.graph['T']
@@ -136,9 +131,8 @@ def test_G_from_routeset_detours(tmp_path):
     id = store_G(G, db=db)
     assert id == 1
 
-    with db_session:
-        rs = db.RouteSet[id]
-        G_rs = G_from_routeset(rs)
+    rs = db.RouteSet.get_by_id(id)
+    G_rs = G_from_routeset(rs)
 
     ignored_keys = {
         'bound',

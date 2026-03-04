@@ -1,3 +1,6 @@
+def open_database(filepath: str, create_db: bool = False):
+    return _open_database(filepath, create_db=create_db)
+
 # SPDX-License-Identifier: MIT
 # https://gitlab.windenergy.dtu.dk/TOPFARM/OptiWindNet/
 
@@ -9,8 +12,7 @@ from socket import getfqdn, gethostname
 
 import networkx as nx
 import numpy as np
-from pony.orm import db_session
-
+from .modelv0 import open_database as _open_database
 from ..interarraylib import calcload
 
 __all__ = ()
@@ -119,9 +121,8 @@ def packmethod(fun, options=None):
 
 def add_if_absent(entity, pack):
     digest = pack['digest']
-    with db_session:
-        if not entity.exists(digest=digest):
-            entity(**pack)
+    if entity.get_or_none(entity.digest == digest) is None:
+        entity.create(**pack)
     return digest
 
 
@@ -162,7 +163,7 @@ def edgeset_from_graph(G, db):
         'landscape_angle',
     }
     nodesetID = nodeset_from_graph(G, db)
-    methodID = (method_from_graph(G, db),)
+    methodID = method_from_graph(G, db)
     machineID = get_machineID(db)
     R = G.graph['R']
     edgepack = dict(
@@ -185,13 +186,12 @@ def edgeset_from_graph(G, db):
         edgepack['clone2prime'] = G.graph['fnT'][T_plus_D - D : T_plus_D]
     else:
         edgepack['D'] = 0
-    with db_session:
         edgepack.update(
-            nodes=db.NodeSet[nodesetID],
-            method=db.Method[methodID],
-            machine=db.Machine[machineID],
-        )
-        db.EdgeSet(**edgepack)
+        nodes=db.NodeSet.get_by_id(nodesetID),
+        method=db.Method.get_by_id(methodID),
+        machine=db.Machine.get_by_id(machineID),
+    )
+    db.EdgeSet.create(**edgepack)
 
 
 def get_machineID(db):
@@ -204,24 +204,18 @@ def get_machineID(db):
             machine = fqdn[len(hostname) :]
         else:
             machine = fqdn
-    with db_session:
-        if not db.Machine.exists(name=machine):
-            newMachine = db.Machine(name=machine).id
-            return newMachine
-        else:
-            oldMachine = db.Machine.get(name=machine).id
-            return oldMachine
+        old = db.Machine.get_or_none(db.Machine.name == machine)
+    if old is not None:
+        return old.id
+    return db.Machine.create(name=machine).id
 
 
 def G_by_method(G, method, db):
-    """Fetch from the database a layout for `G` by `method`.
-    `G` must be a layout solution with the necessary info in the G.graph dict.
-    `method` is a Method.
-    """
-    farmname = G.name
-    c = G.graph['capacity']
+    farm = db.NodeSet.get(db.NodeSet.name == G.name)
     es = db.EdgeSet.get(
-        lambda e: e.nodes.name == farmname and e.method is method and e.capacity == c
+        (db.EdgeSet.nodes == farm)
+        & (db.EdgeSet.method == method)
+        & (db.EdgeSet.capacity == G.graph['capacity'])
     )
     Gdb = graph_from_edgeset(es)
     calcload(Gdb)
@@ -229,24 +223,19 @@ def G_by_method(G, method, db):
 
 
 def Gs_from_attrs(farm, methods, capacities, db):
-    """Fetch from the database a list of tuples of layouts.
-    (each tuple has one G for each of `methods`)
-    `farm` must have the desired NodeSet name in the `name` attribute.
-    `methods` is a tuple of Method instances.
-    `capacities` is an int or sequence thereof.
-    """
     Gs = []
     if not isinstance(methods, Sequence):
         methods = (methods,)
     if not isinstance(capacities, Sequence):
         capacities = (capacities,)
+    farm_row = db.NodeSet.get(db.NodeSet.name == farm.name)
     for c in capacities:
         Gtuple = tuple(
             graph_from_edgeset(
                 db.EdgeSet.get(
-                    lambda e: e.nodes.name == farm.name
-                    and e.method is m
-                    and e.capacity == c
+                    (db.EdgeSet.nodes == farm_row)
+                    & (db.EdgeSet.method == m)
+                    & (db.EdgeSet.capacity == c)
                 )
             )
             for m in methods
@@ -259,5 +248,4 @@ def Gs_from_attrs(farm, methods, capacities, db):
             Gs.append(Gtuple)
     if len(Gs) == 1:
         return Gs[0]
-    else:
-        return Gs
+    return Gs

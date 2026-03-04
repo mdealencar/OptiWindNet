@@ -1,102 +1,110 @@
 # SPDX-License-Identifier: MIT
-# https://gitlab.windenergy.dtu.dk/TOPFARM/OptiWindNet/
-"""Database model v2 for storage of locations and route sets.
-
-Tables:
-  - NodeSet: location definition
-  - RouteSet: routeset (i.e. a record of G)
-  - Method: info on algorithm & options to produce routesets
-  - Machine: info on machine that generated a routeset
-"""
 
 import datetime
 
-from pony.orm import Database, IntArray, Json, Optional, PrimaryKey, Required, Set
-
 from ._core import _naive_utc_now
+from ._peewee import (
+    AutoField,
+    BlobField,
+    BooleanField,
+    DateTimeField,
+    FloatField,
+    ForeignKeyField,
+    IntArrayField,
+    IntegerField,
+    JsonCompatField,
+    Model,
+    TextField,
+    make_db_namespace,
+    open_sqlite_database,
+)
 
-__all__ = ()
+__all__ = ('define_entities', 'open_database')
 
 
-def define_entities(db: Database):
-    class NodeSet(db.Entity):
-        # hashlib.sha256(VertexC + boundary).digest()
-        name = Required(str, unique=True)
-        T = Required(int)  # # of non-root nodes
-        R = Required(int)  # # of root nodes
-        B = Required(int)  # num_border_vertices
-        # vertices (nodes + roots) coordinates (UTM)
-        # pickle.dumps(np.empty((R + T + B, 2), dtype=float)
-        VertexC = Required(bytes)
-        # the first group is the border (ccw), then obstacles (cw)
-        # B is sum(constraint_groups)
-        constraint_groups = Required(IntArray)
-        # indices to VertexC, concatenation of the groups' ordered vertices
-        constraint_vertices = Required(IntArray)
-        landscape_angle = Optional(float)
-        digest = PrimaryKey(bytes)
-        RouteSets = Set(lambda: RouteSet)
+def define_entities(database):
+    class BaseModel(Model):
+        pass
 
-    class RouteSet(db.Entity):
-        id = PrimaryKey(int, auto=True)
-        handle = Required(str)
-        valid = Optional(bool)
-        T = Required(int)  # num_nodes
-        R = Required(int)  # num_roots
-        capacity = Required(int)
-        length = Required(float)
-        is_normalized = Required(bool)
-        # runtime always in [s]
-        runtime = Optional(float)
-        num_gates = Required(IntArray)
-        # number of contour nodes
-        C = Optional(int, default=0)
-        # number of detour nodes
-        D = Optional(int, default=0)
-        # short identifier of routeset origin (redundant with Method)
-        creator = Optional(str)
-        # relative increase from undetoured routeset to the detoured one
-        # detoured_length = (1 + detextra)*undetoured_length
-        detextra = Optional(float)
-        num_diagonals = Optional(int)
-        tentative = Optional(IntArray)
-        rogue = Optional(IntArray)
-        timestamp = Optional(datetime.datetime, default=_naive_utc_now)
-        misc = Optional(Json)
-        stuntC = Optional(bytes)  # coords of border stunts
-        # len(clone2prime) == C + D
-        clone2prime = Optional(IntArray)
-        edges = Required(IntArray)
-        nodes = Required(NodeSet)
-        method = Required(lambda: Method)
-        machine = Optional(lambda: Machine)
+    BaseModel._meta.database = database
 
-    class Method(db.Entity):
-        solver_name = Required(str)
-        funname = Required(str)
-        # options is a dict of function parameters
-        options = Required(Json)
-        timestamp = Required(datetime.datetime, default=_naive_utc_now)
-        funfile = Required(str)
-        # hashlib.sha256(fun.__code__.co_code)
-        funhash = Required(bytes)
-        # hashlib.sha256(funhash + pickle(options)).digest()
-        digest = PrimaryKey(bytes)
-        RouteSets = Set(RouteSet)
+    class NodeSet(BaseModel):
+        name = TextField(unique=True)
+        T = IntegerField()
+        R = IntegerField()
+        B = IntegerField()
+        VertexC = BlobField()
+        constraint_groups = IntArrayField()
+        constraint_vertices = IntArrayField()
+        landscape_angle = FloatField(null=True)
+        digest = BlobField(primary_key=True)
 
-    class Machine(db.Entity):
-        name = Required(str, unique=True)
-        attrs = Optional(Json)
-        RouteSets = Set(RouteSet)
+        class Meta:
+            table_name = 'NodeSet'
 
-    # class CableSet(db.Entity):
-    #     name = Required(str)
-    #     cableset = Required(bytes)
-    #     RouteSets = Set(RouteSet)
-    #     max_capacity = Required(int)
-    #     # name = Required(str)
-    #     # types = Required(int)
-    #     # areas = Required(IntArray)  # mm²
-    #     # capacities  = Required(IntArray)  # num of wtg
-    #     # RouteSets = Set(RouteSet)
-    #     # max_capacity = Required(int)
+    class Method(BaseModel):
+        solver_name = TextField()
+        funname = TextField()
+        options = JsonCompatField()
+        timestamp = DateTimeField(default=_naive_utc_now)
+        funfile = TextField()
+        funhash = BlobField()
+        digest = BlobField(primary_key=True)
+
+        class Meta:
+            table_name = 'Method'
+
+    class Machine(BaseModel):
+        id = AutoField()
+        name = TextField(unique=True)
+        attrs = JsonCompatField(null=True)
+
+        class Meta:
+            table_name = 'Machine'
+
+    class RouteSet(BaseModel):
+        id = AutoField()
+        handle = TextField()
+        valid = BooleanField(null=True)
+        T = IntegerField()
+        R = IntegerField()
+        capacity = IntegerField()
+        length = FloatField()
+        is_normalized = BooleanField()
+        runtime = FloatField(null=True)
+        num_gates = IntArrayField()
+        C = IntegerField(default=0, null=True)
+        D = IntegerField(default=0, null=True)
+        creator = TextField(null=True)
+        detextra = FloatField(null=True)
+        num_diagonals = IntegerField(null=True)
+        tentative = IntArrayField(null=True)
+        rogue = IntArrayField(null=True)
+        timestamp = DateTimeField(null=True, default=_naive_utc_now)
+        misc = JsonCompatField(null=True)
+        stuntC = BlobField(null=True)
+        clone2prime = IntArrayField(null=True)
+        edges = IntArrayField()
+        nodes = ForeignKeyField(NodeSet, backref='RouteSets', column_name='nodes')
+        method = ForeignKeyField(Method, backref='RouteSets', column_name='method')
+        machine = ForeignKeyField(
+            Machine, backref='RouteSets', column_name='machine', null=True
+        )
+
+        class Meta:
+            table_name = 'RouteSet'
+
+    return make_db_namespace(
+        database,
+        NodeSet=NodeSet,
+        RouteSet=RouteSet,
+        Method=Method,
+        Machine=Machine,
+    )
+
+
+def open_database(filepath: str, create_db: bool = False):
+    db = open_sqlite_database(filepath, create_db=create_db)
+    model_ns = define_entities(db)
+    db.create_tables([model_ns.NodeSet, model_ns.Method, model_ns.Machine, model_ns.RouteSet])
+    return model_ns

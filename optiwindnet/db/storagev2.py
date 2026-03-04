@@ -4,7 +4,6 @@
 import base64
 import io
 import json
-import os
 from collections.abc import Sequence
 from functools import partial
 from hashlib import sha256
@@ -14,9 +13,7 @@ from typing import Any, Mapping
 
 import networkx as nx
 import numpy as np
-from pony import orm
-
-from .modelv2 import define_entities
+from .modelv2 import open_database as _open_database
 from ..interarraylib import calcload
 from ..utils import make_handle
 
@@ -93,23 +90,9 @@ _misc_not = {
 }
 
 
-def open_database(filepath: str, create_db: bool = False) -> orm.Database:
-    """Opens the sqlite database v2 file specified in `filepath`.
-
-    Args:
-      filepath: path to database file
-      create_db: True -> create a new file if it does not exist
-
-    Returns:
-      Database object (Pony ORM)
-    """
-    db = orm.Database()
-    define_entities(db)
-    db.bind(
-        'sqlite', os.path.abspath(os.path.expanduser(filepath)), create_db=create_db
-    )
-    db.generate_mapping(create_tables=True)
-    return db
+def open_database(filepath: str, create_db: bool = False):
+    """Open a sqlite database and return the v2 model namespace."""
+    return _open_database(filepath, create_db=create_db)
 
 
 def L_from_nodeset(nodeset: object, handle: str | None = None) -> nx.Graph:
@@ -263,13 +246,12 @@ def packmethod(method_options: dict) -> PackType:
 
 def add_if_absent(entity: object, pack: PackType) -> bytes:
     digest = pack['digest']
-    with orm.db_session:
-        if not entity.exists(digest=digest):
-            entity(**pack)
+    if entity.get_or_none(entity.digest == digest) is None:
+        entity.create(**pack)
     return digest
 
 
-def method_from_G(G: nx.Graph, db: orm.Database) -> bytes:
+def method_from_G(G: nx.Graph, db) -> bytes:
     """
     Returns:
         Primary key of the entry.
@@ -278,7 +260,7 @@ def method_from_G(G: nx.Graph, db: orm.Database) -> bytes:
     return add_if_absent(db.Method, pack)
 
 
-def nodeset_from_G(G: nx.Graph, db: orm.Database) -> bytes:
+def nodeset_from_G(G: nx.Graph, db) -> bytes:
     """Returns primary key of the entry."""
     pack = packnodes(G)
     return add_if_absent(db.NodeSet, pack)
@@ -349,10 +331,6 @@ def untersify_to_G(G: nx.Graph, terse: np.ndarray, clone2prime: list) -> None:
 
 
 def oddtypes_to_serializable(obj):
-    if isinstance(obj, orm.ormtypes.TrackedList):
-        return list(oddtypes_to_serializable(item) for item in obj)
-    if isinstance(obj, orm.ormtypes.TrackedDict):
-        return {k: oddtypes_to_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(oddtypes_to_serializable(item) for item in obj)
     elif isinstance(obj, np.ndarray):
@@ -420,7 +398,7 @@ def pack_G(G: nx.Graph) -> dict[str, Any]:
     return packed_G
 
 
-def store_G(G: nx.Graph, db: orm.Database) -> int:
+def store_G(G: nx.Graph, db) -> int:
     """Store `G`'s data to a new `RouteSet` record in the database `db`.
 
     If the NodeSet or Method are not yet in the database, they will be added.
@@ -434,21 +412,18 @@ def store_G(G: nx.Graph, db: orm.Database) -> int:
     """
     packed_G = pack_G(G)
     nodesetID = nodeset_from_G(G, db)
-    methodID = (method_from_G(G, db),)
+    methodID = method_from_G(G, db)
     machineID = get_machine_pk(db)
-    with orm.db_session:
-        packed_G.update(
-            nodes=db.NodeSet[nodesetID],
-            method=db.Method[methodID],
-            machine=db.Machine[machineID],
-        )
-        rs = db.RouteSet(**packed_G)
-        db.flush()
-        id = rs.id
-    return id
+    packed_G.update(
+        nodes=db.NodeSet.get_by_id(nodesetID),
+        method=db.Method.get_by_id(methodID),
+        machine=db.Machine.get_by_id(machineID),
+    )
+    rs = db.RouteSet.create(**packed_G)
+    return rs.id
 
 
-def get_machine_pk(db: orm.Database) -> int:
+def get_machine_pk(db) -> int:
     fqdn = getfqdn()
     hostname = gethostname()
     if fqdn == 'localhost':
@@ -458,14 +433,13 @@ def get_machine_pk(db: orm.Database) -> int:
             machine = fqdn[len(hostname) :]
         else:
             machine = fqdn
-    with orm.db_session:
-        if db.Machine.exists(name=machine):
-            return db.Machine.get(name=machine).get_pk()
-        else:
-            return db.Machine(name=machine).get_pk()
+    old = db.Machine.get_or_none(db.Machine.name == machine)
+    if old is not None:
+        return old.id
+    return db.Machine.create(name=machine).id
 
 
-def G_by_method(G: nx.Graph, method: object, db: orm.Database) -> nx.Graph:
+def G_by_method(G: nx.Graph, method: object, db) -> nx.Graph:
     """Fetch from the database a layout for `G` by `method`.
     `G` must be a layout solution with the necessary info in the G.graph dict.
     `method` is a Method.
@@ -473,9 +447,9 @@ def G_by_method(G: nx.Graph, method: object, db: orm.Database) -> nx.Graph:
     farmname = G.name
     c = G.graph['capacity']
     rs = db.RouteSet.get(
-        lambda rs: rs.nodes.name == farmname
-        and rs.method is method
-        and rs.capacity == c
+        (db.RouteSet.nodes == db.NodeSet.get(db.NodeSet.name == farmname))
+        & (db.RouteSet.method == method)
+        & (db.RouteSet.capacity == c)
     )
     Gdb = G_from_routeset(rs)
     calcload(Gdb)
@@ -486,7 +460,7 @@ def Gs_from_attrs(
     farm: object,
     methods: object | Sequence[object],
     capacities: int | Sequence[int],
-    db: orm.Database,
+    db,
 ) -> list[tuple[nx.Graph]]:
     """
     Fetch from the database a list (one per capacity) of tuples (one per
@@ -504,9 +478,9 @@ def Gs_from_attrs(
         Gtuple = tuple(
             G_from_routeset(
                 db.RouteSet.get(
-                    lambda rs: rs.nodes.name == farm.name
-                    and rs.method is m
-                    and rs.capacity == c
+                    (db.RouteSet.nodes == db.NodeSet.get(db.NodeSet.name == farm.name))
+                    & (db.RouteSet.method == m)
+                    & (db.RouteSet.capacity == c)
                 )
             )
             for m in methods

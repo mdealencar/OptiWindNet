@@ -1,94 +1,89 @@
 # SPDX-License-Identifier: MIT
-# https://gitlab.windenergy.dtu.dk/TOPFARM/OptiWindNet/
-"""Database model v0 for storage of locations and route sets.
-
-Tables:
-  - NodeSet: location definition
-  - RouteSet: routeset (i.e. a record of G)
-  - Method: info on algorithm & options to produce routesets
-  - Machine: info on machine that generated a routeset
-"""
-
-import datetime
-import os
-
-from pony.orm import Database, IntArray, Optional, PrimaryKey, Required, Set
 
 from ._core import _naive_utc_now
+from ._peewee import (
+    AutoField,
+    BlobField,
+    DateTimeField,
+    FloatField,
+    ForeignKeyField,
+    IntArrayField,
+    IntegerField,
+    Model,
+    TextField,
+    make_db_namespace,
+    open_sqlite_database,
+)
 
-__all__ = ()
+__all__ = ('define_entities', 'open_database')
 
 
-def open_database(filepath: str, create_db: bool = False) -> Database:
-    """Opens the sqlite database v2 file specified in `filepath`.
+def define_entities(database):
+    class BaseModel(Model):
+        pass
 
-    Args:
-      filepath: path to database file
-      create_db: True -> create a new file if it does not exist
+    BaseModel._meta.database = database
 
-    Returns:
-      Database object (Pony ORM)
-    """
-    db = Database()
-    define_entities(db)
-    db.bind(
-        'sqlite', os.path.abspath(os.path.expanduser(filepath)), create_db=create_db
+    class NodeSet(BaseModel):
+        digest = BlobField(primary_key=True)
+        name = TextField(unique=True)
+        handle = TextField(unique=True)
+        T = IntegerField()
+        R = IntegerField()
+        VertexC = BlobField()
+        boundary = BlobField()
+        landscape_angle = FloatField(null=True)
+
+        class Meta:
+            table_name = 'NodeSet'
+
+    class Method(BaseModel):
+        digest = BlobField(primary_key=True)
+        funname = TextField()
+        funhash = BlobField()
+        options = TextField()
+        timestamp = DateTimeField(default=_naive_utc_now)
+
+        class Meta:
+            table_name = 'Method'
+
+    class Machine(BaseModel):
+        id = AutoField()
+        name = TextField(unique=True)
+
+        class Meta:
+            table_name = 'Machine'
+
+    class EdgeSet(BaseModel):
+        id = AutoField()
+        nodes = ForeignKeyField(NodeSet, backref='EdgeSets', column_name='nodes')
+        edges = BlobField()
+        length = FloatField()
+        D = IntegerField(default=0, null=True)
+        clone2prime = IntArrayField(null=True)
+        gates = IntArrayField()
+        method = ForeignKeyField(Method, backref='EdgeSets', column_name='method')
+        capacity = IntegerField()
+        runtime = FloatField(null=True)
+        runtime_unit = TextField(null=True)
+        machine = ForeignKeyField(Machine, backref='EdgeSets', column_name='machine', null=True)
+        timestamp = DateTimeField(null=True, default=_naive_utc_now)
+        misc = BlobField(null=True)
+
+        class Meta:
+            table_name = 'EdgeSet'
+
+    return make_db_namespace(
+        database,
+        NodeSet=NodeSet,
+        EdgeSet=EdgeSet,
+        Method=Method,
+        Machine=Machine,
     )
-    db.generate_mapping(create_tables=True)
-    return db
 
 
-def define_entities(db: Database):
-    class NodeSet(db.Entity):
-        # hashlib.sha256(VertexC + boundary).digest()
-        digest = PrimaryKey(bytes)
-        name = Required(str, unique=True)
-        handle = Required(str, unique=True)
-        T = Required(int)  # # of non-root nodes
-        R = Required(int)  # # of root nodes
-        # vertices (nodes + roots) coordinates (UTM)
-        # pickle.dumps(np.empty((T + R, 2), dtype=float)
-        VertexC = Required(bytes)
-        # region polygon: P vertices (x, y), ordered ccw
-        # pickle.dumps(np.empty((P, 2), dtype=float)
-        boundary = Required(bytes)
-        landscape_angle = Optional(float)
-        EdgeSets = Set(lambda: EdgeSet)
-
-    class EdgeSet(db.Entity):
-        nodes = Required(NodeSet)
-        # edges = pickle.dumps(
-        # np.array([(u, v)
-        #           for u, v in G.edges], dtype=int))
-        edges = Required(bytes)
-        length = Required(float)
-        # number of Detour nodes
-        D = Optional(int, default=0)
-        clone2prime = Optional(IntArray)
-        gates = Required(IntArray)
-        method = Required(lambda: Method)
-        capacity = Required(int)
-        # cables = Optional(lambda: CableSet)
-        runtime = Optional(float)
-        runtime_unit = Optional(str)
-        machine = Optional(lambda: Machine)
-        timestamp = Optional(datetime.datetime, default=_naive_utc_now)
-        # DetourC = Optional(bytes)  # superceeded by D and clone2prime
-        # misc is a pickled python dictionary
-        misc = Optional(bytes)
-
-    class Method(db.Entity):
-        # hashlib.sha256(funhash + options).digest()
-        digest = PrimaryKey(bytes)
-        funname = Required(str)
-        # hashlib.sha256(esauwilliams.__code__.co_code)
-        funhash = Required(bytes)
-        # capacity = Required(int)
-        # options is a dict of function parameters
-        options = Required(str)
-        timestamp = Required(datetime.datetime, default=_naive_utc_now)
-        EdgeSets = Set(EdgeSet)
-
-    class Machine(db.Entity):
-        name = Required(str, unique=True)
-        EdgeSets = Set(EdgeSet)
+def open_database(filepath: str, create_db: bool = False):
+    db = open_sqlite_database(filepath, create_db=create_db)
+    model_ns = define_entities(db)
+    db.create_tables([model_ns.NodeSet, model_ns.Method, model_ns.Machine, model_ns.EdgeSet])
+    return model_ns
