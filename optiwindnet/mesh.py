@@ -511,6 +511,7 @@ def make_planar_embedding(
         out_root_pts = shp.MultiPoint()
         hull_border_vertices = ()
         hull_border_xy_ = set()
+        border_poly = None
     else:
         border_poly = shp.Polygon(shell=VertexS[border])
 
