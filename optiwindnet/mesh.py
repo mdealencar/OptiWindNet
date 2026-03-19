@@ -337,6 +337,77 @@ def _hull_processor(
     return convex_hull, to_remove, conc_outer_edges
 
 
+def _build_hull_concave(concavities, hull_prunned, VertexS, border_poly, P_A):
+    if concavities:
+        hull_prunned_poly = shp.Polygon(shell=VertexS[hull_prunned])
+        shp.prepare(hull_prunned_poly)
+        shp.prepare(border_poly)
+        if not border_poly.covers(hull_prunned_poly):
+            hull_concave = []
+            i = 2
+            u, v = hull_prunned[:i]
+            end = u
+            for _ in range(P_A.number_of_edges()):
+                edge_line = shp.LineString(VertexS[[u, v]])
+                if border_poly.covers(edge_line):
+                    hull_concave.append(v)
+                    if v == end:
+                        # TODO: make this test more robust
+                        if len(hull_concave) < len(hull_prunned):
+                            # this likely means an islanded subgraph was found
+                            debug('islanded hull_concave', hull_concave)
+                            hull_concave.clear()
+                            u, v = v, hull_prunned[i]
+                            end = u
+                            i += 1
+                            continue
+                        break
+                    u, v = v, P_A[v][u]['ccw']
+                    continue
+                else:
+                    v = P_A[u][v]['ccw']
+                    if not hull_concave and v == hull_prunned[i - 1]:
+                        # not able to start with this ⟨u, v⟩ link
+                        debug('failed start', u, v)
+                        u, v = v, hull_prunned[i]
+                        end = u
+                        i += 1
+            else:
+                warn('Too many iterations building hull_concave: %s', hull_concave)
+        else:
+            hull_concave = hull_prunned
+    else:
+        hull_concave = hull_prunned
+    return hull_concave
+
+
+def _calc_norm_offset_and_scale(border, VertexC, convex_hull_A, R, hull_concave):
+    if len(border) == 0:
+        bX, bY = VertexC[convex_hull_A].T
+    else:
+        # for the bounding box, use border and roots
+        bX, bY = np.vstack((VertexC[border], VertexC[-R:])).T
+    # assuming that coordinates are UTM -> min() as bbox's offset to origin
+    norm_offset = np.array((bX.min(), bY.min()), dtype=np.float64)
+    hull_concaveC = VertexC[hull_concave + hull_concave[0:1]]
+    semi_perimeter = np.hypot(*(hull_concaveC[1:] - hull_concaveC[:-1]).T).sum() / 2
+    # Shoelace formula for area (https://stackoverflow.com/a/30408825/287217).
+    area_hull = 0.5 * abs(
+        np.dot(hull_concaveC[:-1, 0], hull_concaveC[1:, 1])
+        - np.dot(hull_concaveC[:-1, 1], hull_concaveC[1:, 0])
+    )
+    sqrt_area_hull = math.sqrt(area_hull)
+    # Derive a scaling factor from some property of the concave hull
+    if sqrt_area_hull < 1e-4 * semi_perimeter:
+        # the concave hull is essentially a line with area close to zero
+        # derive the scaling factor of coordinates from the semi-perimeter
+        norm_scale = 1.0 / semi_perimeter
+    else:
+        # derive the scaling factor of coordinates so that the scaled area is 1
+        norm_scale = 1.0 / sqrt_area_hull
+    return norm_offset, norm_scale
+
+
 def make_planar_embedding(
     L: nx.Graph,
     offset_scale: float = 1e-4,
@@ -796,46 +867,9 @@ def make_planar_embedding(
     # G) Build the hull-concave.
     # ##########################
     debug('PART G')
-    if concavities:
-        hull_prunned_poly = shp.Polygon(shell=VertexS[hull_prunned])
-        shp.prepare(hull_prunned_poly)
-        shp.prepare(border_poly)
-        if not border_poly.covers(hull_prunned_poly):
-            hull_concave = []
-            i = 2
-            u, v = hull_prunned[:i]
-            end = u
-            for _ in range(P_A.number_of_edges()):
-                edge_line = shp.LineString(VertexS[[u, v]])
-                if border_poly.covers(edge_line):
-                    hull_concave.append(v)
-                    if v == end:
-                        # TODO: make this test more robust
-                        if len(hull_concave) < len(hull_prunned):
-                            # this likely means an islanded subgraph was found
-                            debug('islanded hull_concave', hull_concave)
-                            hull_concave.clear()
-                            u, v = v, hull_prunned[i]
-                            end = u
-                            i += 1
-                            continue
-                        break
-                    u, v = v, P_A[v][u]['ccw']
-                    continue
-                else:
-                    v = P_A[u][v]['ccw']
-                    if not hull_concave and v == hull_prunned[i - 1]:
-                        # not able to start with this ⟨u, v⟩ link
-                        debug('failed start', u, v)
-                        u, v = v, hull_prunned[i]
-                        end = u
-                        i += 1
-            else:
-                warn('Too many iterations building hull_concave: %s', hull_concave)
-        else:
-            hull_concave = hull_prunned
-    else:
-        hull_concave = hull_prunned
+    hull_concave = _build_hull_concave(
+        concavities, hull_prunned, VertexS, border_poly, P_A
+    )
     debug('hull_concave: %s', hull_concave)
 
     # ##########################################
@@ -1330,29 +1364,9 @@ def make_planar_embedding(
     # O) Calculate the area of the concave hull.
     # ##########################################
     debug('PART O')
-    if len(border) == 0:
-        bX, bY = VertexC[convex_hull_A].T
-    else:
-        # for the bounding box, use border and roots
-        bX, bY = np.vstack((VertexC[border], VertexC[-R:])).T
-    # assuming that coordinates are UTM -> min() as bbox's offset to origin
-    norm_offset = np.array((bX.min(), bY.min()), dtype=np.float64)
-    hull_concaveC = VertexC[hull_concave + hull_concave[0:1]]
-    semi_perimeter = np.hypot(*(hull_concaveC[1:] - hull_concaveC[:-1]).T).sum() / 2
-    # Shoelace formula for area (https://stackoverflow.com/a/30408825/287217).
-    area_hull = 0.5 * abs(
-        np.dot(hull_concaveC[:-1, 0], hull_concaveC[1:, 1])
-        - np.dot(hull_concaveC[:-1, 1], hull_concaveC[1:, 0])
+    norm_offset, norm_scale = _calc_norm_offset_and_scale(
+        border, VertexC, convex_hull_A, R, hull_concave
     )
-    sqrt_area_hull = math.sqrt(area_hull)
-    # Derive a scaling factor from some property of the concave hull
-    if sqrt_area_hull < 1e-4 * semi_perimeter:
-        # the concave hull is essentially a line with area close to zero
-        # derive the scaling factor of coordinates from the semi-perimeter
-        norm_scale = 1.0 / semi_perimeter
-    else:
-        # derive the scaling factor of coordinates so that the scaled area is 1
-        norm_scale = 1.0 / sqrt_area_hull
 
     # ############################
     # P) Set A's graph attributes.
