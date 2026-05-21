@@ -40,10 +40,13 @@ TOGGLE_DEFAULTS = dict(
     INSERTION_NO_CLOSE=False, INSERTION_PROTECT_BRIDGE=False, SUBROOT_FULLGATE=False,
 )
 _NSR = dict(NBEW_SELECT=True, TIEBREAK_NODE_RANK=True, NO_SUBROOT_CHANGE=True, RETRY_PARKED=True)
+# note: binning (NBEW_SELECT) is only paired with NO_SUBROOT_CHANGE. NBEW's
+# weight binning normalizes by min weight and assumes strictly positive weights;
+# radial_EW's subroot-change can yield extents <= 0, so binning+subroot-change is
+# an incoherent pairing and is intentionally not benchmarked.
 VARIANTS = {
     'base':  dict(),
     'nosc':  dict(NO_SUBROOT_CHANGE=True),
-    'nbsel': dict(NBEW_SELECT=True, TIEBREAK_NODE_RANK=True),
     'retry': dict(RETRY_PARKED=True),
     'nsr':   dict(**_NSR),
 }
