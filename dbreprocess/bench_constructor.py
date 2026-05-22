@@ -44,12 +44,18 @@ _NSR = dict(NBEW_SELECT=True, TIEBREAK_NODE_RANK=True, NO_SUBROOT_CHANGE=True, R
 # weight binning normalizes by min weight and assumes strictly positive weights;
 # radial_EW's subroot-change can yield extents <= 0, so binning+subroot-change is
 # an incoherent pairing and is intentionally not benchmarked.
-VARIANTS = {
+RADIAL_VARIANTS = {
     'base':  dict(),
     'nosc':  dict(NO_SUBROOT_CHANGE=True),
     'retry': dict(RETRY_PARKED=True),
     'nsr':   dict(**_NSR),
 }
+# the experiment toggles are radial_EW-specific; biased_EW just runs as shipped
+BIASED_VARIANTS = {'base': dict()}
+
+
+def variants_for(method: str) -> dict:
+    return BIASED_VARIANTS if method == 'biased_EW' else RADIAL_VARIANTS
 
 
 def _enumerate_jobs(source_db: Path) -> list[tuple[str, int, float]]:
@@ -81,7 +87,7 @@ def _produce(digest_hex: str, capacity: int, ref: float, *,
                     error=f'{type(exc).__name__}: {exc}',
                     traceback=traceback.format_exc())
     rec = dict(digest=digest_hex, capacity=capacity, ref=ref, ok=True, lengths={})
-    for name, flags in VARIANTS.items():
+    for name, flags in variants_for(method).items():
         for k, dv in TOGGLE_DEFAULTS.items():
             setattr(constructor_exp, k, flags.get(k, dv))
         try:
@@ -113,7 +119,7 @@ def run(*, source_db: Path, log_path: Path, cache_dir: Path, jobs_count: int,
         delayed(build_PA)(d, source_db=source_db, cache_dir=cache_dir) for d in digests)
     print(f'  done in {time.perf_counter()-t0:.0f}s')
 
-    print(f'running {len(VARIANTS)} variants ({method}, {feeder}) over {len(jobs)} instances...')
+    print(f'running {len(variants_for(method))} variants ({method}, {feeder}) over {len(jobs)} instances...')
     t0 = time.perf_counter()
     results = Parallel(n_jobs=jobs_count, backend='loky', verbose=5)(
         delayed(_produce)(d, c, r, method=method, mode=mode,
