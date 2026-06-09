@@ -1,0 +1,8 @@
+name: Sync Fork
+on:
+  workflow_dispatch: # Keeps the button visible in the UI
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "This is a placeholder. Run this workflow from the sync-automation branch."
