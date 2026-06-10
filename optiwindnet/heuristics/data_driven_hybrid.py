@@ -328,7 +328,6 @@ def data_driven_hybrid(
     appraiser: Appraiser,
     maxiter=10000,
     threshold: float = 0.0,
-    blockage_subtree_feeder_lim: float = 5.5,
 ) -> nx.Graph:
     """Hybrid machine-learning and Esau-Williams heuristic for C-MST
 
@@ -355,6 +354,7 @@ def data_driven_hybrid(
     A = as_normalized(Aʹ, scale=T / MSF.size(weight='length'))
     A.graph['d2roots_rank_'] = d2roots_rank_
     d2roots = A.graph['d2roots']
+    VertexC = A.graph['VertexC']
     roots = range(-R, 0)
 
     add_terminal_closest_root(A)
@@ -407,7 +407,15 @@ def data_driven_hybrid(
     subtree_span_ = [[(t, t) for _ in roots] for t in _T]
     # <subtree_blocked_>: sets of blocked terminals from other components
     subtree_blocked_ = [zeros(T) for _ in _T]
-    max_blockable = blockage_subtree_feeder_lim * capacity
+    # detour bookkeeping for the self-calibrating detour-vs-savings gate
+    # (ported from `constructor`'s `weigh_detours` mechanism)
+    # <is_root_nb__>: per-root mask of node coords that are the last hop of a
+    #                 committed feeder route
+    is_root_nb__ = tuple(zeros(T) for _ in roots)
+    # <is_corner_>: mask of node coords that are detour corners
+    is_corner_ = zeros(T)
+    # <detours_via_prime_>: holds the detour segment(s) upstream from each corner
+    detours_via_prime_ = defaultdict(list)
 
     # other structures
     # <pq>: queue prioritized by lowest negative appraisal
@@ -448,6 +456,61 @@ def data_driven_hybrid(
         angle_ccw,
     )
 
+    def estimate_detours(u, v, sr_dropped, sr_kept):
+        """Estimate the feeder-detour length increase caused by union (u, v).
+
+        Ported from `constructor`'s `weigh_detours` mechanism. Compares an
+        estimated increase in feeder detour length against the candidate's own
+        length savings, so no tuned reference value is required (metres vs
+        metres). Note: the detour_increase calculated here is an estimate.
+        """
+        # assess the union's angle span
+        union_span_ = [
+            union_limits(
+                r, u, *subtree_span_[sr_dropped][r], v, *subtree_span_[sr_kept][r]
+            )
+            for r in roots
+        ]
+        blocked__ = A[u][v]['blocked__']
+        detour_increase = 0.0
+        changes = []
+        union = subtree_[sr_dropped] | subtree_[sr_kept]
+        for r, blocked_, is_root_nb_ in zip(roots, blocked__, is_root_nb__):
+            lo, hi = union_span_[r]
+            hops = []
+            for prime in (is_root_nb_ & blocked_ & ~union).search(_ONE):
+                # feeder blocked by (u, v) was not previously detoured by union
+                former_extent = d2roots[prime, r]
+                if prime in detours_via_prime_:
+                    hops.extend(
+                        (prime, former_extent, None)
+                        for _ in detours_via_prime_[prime]
+                    )
+                if subtree_[prime] is not None:
+                    hops.append((prime, former_extent, None))
+            moved_by_uv_ = is_root_nb_ & is_corner_ & union
+            # the extremes (lo and hi) of union are not affected by (u, v)
+            moved_by_uv_[lo] = moved_by_uv_[hi] = False
+            for prime in moved_by_uv_.search(_ONE):
+                # edge (u, v) changes an existing feeder detour
+                # move to the previous coordinate in the detour
+                for hop in detours_via_prime_[prime]:
+                    former_extent = d2roots[prime, r] + np.hypot(
+                        *(VertexC[hop] - VertexC[prime])
+                    )
+                    hops.append((hop, former_extent, prime))
+            for hop, former_extent, dropped in hops:
+                extent_lo = d2roots[lo, r] + np.hypot(*(VertexC[lo] - VertexC[hop]))
+                extent_hi = d2roots[hi, r] + np.hypot(*(VertexC[hi] - VertexC[hop]))
+                extent, corner = (
+                    (extent_lo, lo) if extent_lo <= extent_hi else (extent_hi, hi)
+                )
+                detour_increase += (extent - former_extent).item()
+                changes.append((hop, corner, r, dropped))
+        if changes:
+            debug('detour increase of %.3f for rerouting %s', detour_increase, changes)
+        return detour_increase, union_span_, changes
+
     def refresh_subtree(subroot):
         """
         - examine all the links incident on the subtree of subroot;
@@ -482,18 +545,7 @@ def data_driven_hybrid(
                         # only add to unfeas_links once
                         unfeas_links.append(uv_uniq)
                     continue
-                elif (
-                    load_other > load_left
-                    or (
-                        (
-                            subtree_blocked_[subroot]
-                            | subtree_blocked_[sr_v]
-                            | uvD['blocked__'][root_v]
-                        )
-                        & ~(subtree_[sr_v] | subtree_[subroot])
-                    ).count()
-                    > max_blockable
-                ):
+                elif load_other > load_left:
                     link_caused_staleness.add(sr_v)
                     unfeas_links.append(uv_uniq)
                     continue
@@ -560,6 +612,8 @@ def data_driven_hybrid(
         if not feas_unions:
             # this handles subtrees that became isolated
             S.add_edge(subroot, root)
+            # the subroot is now the last hop of a committed feeder route
+            is_root_nb__[root][subroot] = True
             subtree_nodes = tuple(subtree_[subroot].search(_ONE))
             A.remove_nodes_from(subtree_nodes)
             debug('<refresh> subroot <%d> finalized (isolated)', subroot)
@@ -682,13 +736,35 @@ def data_driven_hybrid(
         root = A.nodes[sr_kept]['root']
         subtree = subtree_[sr_kept]
 
-        # assess the union's angle span
-        union_span_ = [
-            union_limits(
-                r, u, *subtree_span_[sr_dropped][r], v, *subtree_span_[sr_kept][r]
+        # assess the union's angle span and the growth in feeder detours it forces
+        detour_growth, union_span_, changes = estimate_detours(
+            u, v, sr_dropped, sr_kept
+        )
+        # the candidate's own length saving (mirrors refresh_subtree's sentinel at
+        # `extent > d2roots[subroot, root]` and the 'saving' appraisal feature)
+        extent = A[u][v]['length']
+        root_dropped = A.nodes[sr_dropped]['root']
+        savings = d2roots[sr_dropped, root_dropped] - extent
+        if savings < detour_growth:
+            # the link's saving is outweighed by the feeder detours it would force:
+            # reject this union, drop the edge and let the main loop pick the next
+            # best candidate (mirrors `constructor`'s weigh_detours gate)
+            debug(
+                '<discard> «%d~%d»: saving (%.3f) smaller than growth in detours'
+                ' (%.3f)',
+                u,
+                v,
+                savings,
+                detour_growth,
             )
-            for r in roots
-        ]
+            A.remove_edge(u, v)
+            purge_log[iteration].append(((u, v),))
+            # force a full re-evaluation of sr_dropped (its top link was rejected);
+            # resetting the category ensures refresh re-files it in prio_tier_
+            prio_tier_[cat_feas_unions_[sr_dropped]].discard(sr_dropped)
+            cat_feas_unions_[sr_dropped] = -1
+            stale_subtrees.add(sr_dropped)
+            continue
         debug('<angle_span> //%s//', union_span_[root])
 
         # edge addition starts here
@@ -729,6 +805,20 @@ def data_driven_hybrid(
         is_feederless_[sr_dropped] = False
         # update the component's angle span
         subtree_span_[sr_kept] = union_span_
+        # apply the detour rerouting bookkeeping (ported from `constructor`)
+        for hop, corner, r, dropped in changes:
+            if dropped is not None:
+                # detour corner swap: hop->dropped->r changes to hop->corner->r
+                is_corner_[dropped] = False
+                if dropped in detours_via_prime_:
+                    del detours_via_prime_[dropped]
+                is_root_nb__[r][dropped] = False
+            else:
+                # detour segment creation (hop->corner->r)
+                is_root_nb__[r][hop] = False
+            detours_via_prime_[corner].append(hop)
+            is_corner_[corner] = True
+            is_root_nb__[r][corner] = True
         # update the component's blocked set
         # TODO: handle multiple roots
         subtree_blocked_[sr_kept] |= (
@@ -739,6 +829,9 @@ def data_driven_hybrid(
         # update terminal->subroot mapping for sr_dropped's terminals
         for t in subtree_[sr_dropped].search(_ONE):
             subroot_[t] = sr_kept
+        # mark the consumed subtree so `estimate_detours` skips it as a direct
+        # feeder (mirrors `constructor`'s `subtree_[sr_dropped] = None`)
+        subtree_[sr_dropped] = None
 
         stale_subtrees.clear()
         whoneeds_[sr_kept].remove(sr_dropped)
@@ -747,6 +840,8 @@ def data_driven_hybrid(
         if subtree.count() == capacity:
             stale_subtrees.discard(sr_kept)
             S.add_edge(sr_kept, root)
+            # the subroot is now the last hop of a committed feeder route
+            is_root_nb__[root][sr_kept] = True
             debug('subroot <%d> finalized (full load)', sr_kept)
             is_feederless_[sr_kept] = False
             steps_log[iteration].append((sr_kept, root))
