@@ -1414,24 +1414,27 @@ class PathFinder:
             else:
                 touching_at[mp[0]].append(fence)
 
-        # Detect dead-end spanning chains. At a chain-end vertex, two spanning
-        # fences of the *same* subtree that present the *same* off-constraint
-        # wall (their off-constraint endpoint, a node-vertex) pinch the corridor
-        # down to a single same-subtree node: there is no through-route, so the
-        # chain leads into a dead end and is not worth routing. Mark such chains
-        # by key so they are dropped at *both* mp-ends — dropping only the end
-        # where the walls coincide would leave the other end with a lone cone
-        # that fails the 2-cone pairing below. Spanning fences of *different*
-        # subtrees sharing a wall remain a genuine ambiguity, handled (rejected)
-        # in `_build_chains_at`; chains of other subtrees along the same border
-        # are untouched.
+        # Detect dead-end spanning chains. When two spanning fences of the
+        # *same* subtree meet at one chain-end vertex, both walls of the
+        # corridor there belong to that subtree, so the corridor leads back
+        # into the same tree — a dead-end pocket with no useful through-route,
+        # not worth routing. (If the two off-constraint walls coincide on a
+        # single node-vertex the corridor pinches to a point; if they are
+        # distinct the inner wall still shadows the outer, so only one fence
+        # could ever own the shared access cone. Both are treated the same: a
+        # genuine through-chain in this configuration would need an extremely
+        # contrived instance.) Mark such chains by key so they are dropped at
+        # *both* mp-ends — dropping only one end would leave the other with a
+        # lone cone that fails the 2-cone pairing below. Spanning fences of
+        # *different* subtrees sharing a wall remain a genuine ambiguity,
+        # handled (rejected) in `_build_chains_at`; chains of other subtrees
+        # along the same border are untouched.
         dead_chain_keys: set[tuple[int, int, int]] = set()
         for endings in spanning_at.values():
-            walls: dict[tuple[int, int], list[Fence]] = defaultdict(list)
-            for fence, side in endings:
-                off = fence.endpoints[0] if side == 'start' else fence.endpoints[1]
-                walls[(off, fence.subtree)].append(fence)
-            for shared in walls.values():
+            by_subtree: dict[int, list[Fence]] = defaultdict(list)
+            for fence, _side in endings:
+                by_subtree[fence.subtree].append(fence)
+            for shared in by_subtree.values():
                 if len(shared) >= 2:
                     for fence in shared:
                         mp = fence.primes_on_constraint
