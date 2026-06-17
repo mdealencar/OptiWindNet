@@ -1,8 +1,25 @@
 name: Sync Fork
+
 on:
-  workflow_dispatch: # Keeps the button visible in the UI
+  schedule:
+    - cron: '0 0 * * *' # Runs automatically every day
+  workflow_dispatch: # Keeps the manual "Run workflow" button in the UI
+
 jobs:
-  placeholder:
+  mirror-sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - run: echo "This is a placeholder. Run this workflow from the sync-automation branch."
+      - name: Force Push Mirror
+        run: |
+          # Clone the upstream repository cleanly into a temporary folder
+          git clone --mirror https://github.com/DTUWindEnergy/OptiWindNet.git upstream-repo
+          cd upstream-repo
+          
+          # Authorize and point to your fork
+          git remote set-url --push origin https://x-token-auth:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          # Force-push their main branch directly onto your fork's main branch
+          git push origin refs/heads/main:refs/heads/main --force
